@@ -11,8 +11,12 @@ To compile the code to a Linux Kernel module:
 Once we get the file "cyrstal.ko", we can run command "insmod ./crystal.ko" to load this module to Kernel. Then we can use command "dmesg" to check whether this module is loaded to Kernel successfully or not. 
 
 Now we can use the following code to enable the quick UDP 5 tuples connection lookup feature in the UPD programs:
+
 sock = socket(PF_INET, SOCK_DGRAM, 0);
+
 int optval = 1;
 setsockopt(sock, SOL_UDP, 200, &optval, sizeof(optval));
+
 bind(...); // this is not necessary
+
 connect(...);
