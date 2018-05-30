@@ -112,6 +112,21 @@ static int compat_quic_setsockopt(struct sock *sk, int level, int optname,
 }
 #endif // CONFIG_COMPAT
 
+static inline bool is_quic(struct sock *sk)
+{
+    return sock_flag(sk, SOCK_QUIC);
+}
+
+static inline void set_quic(struct sock *sk)
+{
+    sock_set_flag(sk, SOCK_QUIC);
+}
+
+static inline void unset_quic(struct sock *sk)
+{
+    sock_reset_flag(sk, SOCK_QUIC);
+}
+
 static unsigned int quic_ehashfn(struct net *net, const __be32 laddr,
                  const __u16 lport, const __be32 faddr,
                  const __be16 fport)
@@ -146,9 +161,10 @@ begin:
         if (sk->sk_hash != hash)
             continue;
         if (likely(INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
-            if (unlikely(!atomic_inc_not_zero_hint(&sk->sk_refcnt, 2)))
+            if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt)))
                 goto out;
-            if (unlikely(!INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
+            if (unlikely((!INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif)) ||
+                         (!is_quic(sk)))) {
                 sock_put(sk);
                 goto begin;
             }
@@ -171,21 +187,6 @@ found:
     return sk;
 }
 
-static inline bool is_quic(struct sock *sk)
-{
-    return sock_flag(sk, SOCK_QUIC);
-}
-
-static inline void set_quic(struct sock *sk)
-{
-    sock_set_flag(sk, SOCK_QUIC);
-}
-
-static inline void unset_quic(struct sock *sk)
-{
-    sock_reset_flag(sk, SOCK_QUIC);
-}
-
 static int quic_hash_connect(struct sock *sk, __be32 laddr,
                              __u16 hnum, __be32 faddr, __be16 fport)
 {
@@ -200,19 +201,6 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
 
     DEBUG_QUIC("quic connect: laddr = %x, faddr = %x, hnum = %u, fport = %u, hash = %x, slot = %u\n",
                laddr, faddr, hnum, ntohs(fport), hash, slot);
-
-    spin_lock_bh(&hslot->lock);
-
-    udp_portaddr_for_each_entry(sk2, node, &hslot->head) {
-        if (sk2->sk_hash != hash)
-            continue;
-        if (likely(INET_MATCH(sk2, net, acookie, faddr, laddr, ports, sk->sk_bound_dev_if))) {
-            spin_unlock_bh(&hslot->lock);
-            return -1;
-        }
-    }
-
-    spin_unlock_bh(&hslot->lock);
 
     udp_lib_unhash(sk);
     /* udp_lib_unhash will set inet_num to 0, so need set it back */
@@ -234,9 +222,9 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
 
     sk->sk_hash = hash;
     sock_hold(sk);
+    set_quic(sk);
     hlist_nulls_add_head_rcu(&udp_sk(sk)->udp_portaddr_node, &hslot->head);
     sock_prot_inuse_add(net, sk->sk_prot, 1);
-    set_quic(sk);
 
     spin_unlock_bh(&hslot->lock);
 
@@ -251,13 +239,14 @@ void quic_unhash(struct sock *sk)
     unsigned int slot;
     struct quic_hslot *hslot;
 
+    lock_sock(sk);
+
     if (!is_quic(sk)) {
+        release_sock(sk);
         return udp_lib_unhash(sk);
     }
 
-    if (hlist_nulls_unhashed(&udp_sk(sk)->udp_portaddr_node)) {
-        return;
-    }
+    BUG_ON(hlist_nulls_unhashed(&udp_sk(sk)->udp_portaddr_node));
 
     slot = sk->sk_hash & quic_table.mask;
     hslot = &quic_table.hash[slot];
@@ -268,18 +257,15 @@ void quic_unhash(struct sock *sk)
 
     spin_lock_bh(&hslot->lock);
 
-    if (hlist_nulls_unhashed(&udp_sk(sk)->udp_portaddr_node)) {
-        spin_unlock_bh(&hslot->lock);
-        return;
-    }
-
-    unset_quic(sk);
     hlist_nulls_del_init_rcu(&udp_sk(sk)->udp_portaddr_node);
+    unset_quic(sk);
     WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
     __sock_put(sk);
     sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 
     spin_unlock_bh(&hslot->lock);
+
+    release_sock(sk);
 
     DEBUG_QUIC("quic unhash success: laddr = %x, faddr = %x, hnum = %u, fport = %u, hash = %x, slot = %u\n",
                inet_sk(sk)->inet_rcv_saddr, inet_sk(sk)->inet_daddr, inet_sk(sk)->inet_num,
@@ -628,6 +614,7 @@ void cleanup_module(void)
 
     ip_protos[IPPROTO_UDP] = orig_protocol;
 
+    /* TODO: safely free the memory */
     vfree(quic_table.hash);
 }
 
