@@ -114,16 +114,19 @@ static int compat_quic_setsockopt(struct sock *sk, int level, int optname,
 
 static inline bool is_quic(struct sock *sk)
 {
+    smp_rmb();
     return sock_flag(sk, SOCK_QUIC);
 }
 
 static inline void set_quic(struct sock *sk)
 {
+    smp_wmb();
     sock_set_flag(sk, SOCK_QUIC);
 }
 
 static inline void unset_quic(struct sock *sk)
 {
+    smp_wmb();
     sock_reset_flag(sk, SOCK_QUIC);
 }
 
