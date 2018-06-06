@@ -1,6 +1,6 @@
 obj-m += crystal.o
 
-KDIR := /root/rpmbuild/SOURCES/linux-3.10.0-327.36.3.el7/
+KDIR := /root/rpmbuild/SOURCES/linux-3.10.0-862.2.3.el7/
 
 PWD := $(shell pwd)
 

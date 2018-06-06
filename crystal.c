@@ -34,15 +34,17 @@
 static int quic_rcv(struct sk_buff *skb);
 
 static struct net_protocol quic_protocol = {
-    .handler =      quic_rcv,
-    /* TODO: we need replace err_handler later */ 
-    .err_handler =  NULL,
-    .no_policy =    1,
-    .netns_ok =     1,
+    /* TODO: we need implement early_demux later */
+    .early_demux = NULL,
+    .handler     = quic_rcv,
+    /* TODO: we need replace err_handler later */
+    .err_handler = NULL,
+    .no_policy   = 1,
+    .netns_ok    = 1,
 };
 
 struct quic_hslot {
-    struct hlist_nulls_head head;
+    struct hlist_head head;
     spinlock_t lock;
 };
 
@@ -114,16 +116,19 @@ static int compat_quic_setsockopt(struct sock *sk, int level, int optname,
 
 static inline bool is_quic(struct sock *sk)
 {
+    smp_rmb();
     return sock_flag(sk, SOCK_QUIC);
 }
 
 static inline void set_quic(struct sock *sk)
 {
+    smp_wmb();
     sock_set_flag(sk, SOCK_QUIC);
 }
 
 static inline void unset_quic(struct sock *sk)
 {
+    smp_wmb();
     sock_reset_flag(sk, SOCK_QUIC);
 }
 
@@ -147,7 +152,6 @@ static inline struct sock *__quic_lib_lookup(struct net *net, __be32 saddr,
     unsigned short hnum = ntohs(dport);
     const __portpair ports = INET_COMBINED_PORTS(sport, hnum);
     struct sock *sk;
-    struct hlist_nulls_node *node;
     unsigned int hash = quic_ehashfn(net, daddr, hnum, saddr, sport);
     unsigned int slot = hash & quic_table.mask;
     struct quic_hslot *hslot = &quic_table.hash[slot];
@@ -157,7 +161,7 @@ static inline struct sock *__quic_lib_lookup(struct net *net, __be32 saddr,
 
     rcu_read_lock();
 begin:
-    udp_portaddr_for_each_entry_rcu(sk, node, &hslot->head) {
+    udp_portaddr_for_each_entry_rcu(sk, &hslot->head) {
         if (sk->sk_hash != hash)
             continue;
         if (likely(INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
@@ -173,13 +177,6 @@ begin:
             goto found;
         }
     }
-    /*
-     * if the nulls value we got at the end of this lookup is
-     * not the expected one, we must restart lookup.
-     * We probably met an item that was moved to another chain.
-     */
-    if (get_nulls_value(node) != slot)
-        goto begin;
 out:
     sk = NULL;
 found:
@@ -197,7 +194,6 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
     unsigned int slot = hash & quic_table.mask;
     struct quic_hslot *hslot = &quic_table.hash[slot];
     struct sock *sk2;
-    struct hlist_nulls_node *node;
 
     DEBUG_QUIC("quic connect: laddr = %x, faddr = %x, hnum = %u, fport = %u, hash = %x, slot = %u\n",
                laddr, faddr, hnum, ntohs(fport), hash, slot);
@@ -211,7 +207,7 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
 
     spin_lock_bh(&hslot->lock);
 
-    udp_portaddr_for_each_entry(sk2, node, &hslot->head) {
+    udp_portaddr_for_each_entry(sk2, &hslot->head) {
         if (sk2->sk_hash != hash)
             continue;
         if (likely(INET_MATCH(sk2, net, acookie, faddr, laddr, ports, sk->sk_bound_dev_if))) {
@@ -223,7 +219,7 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
     sk->sk_hash = hash;
     sock_hold(sk);
     set_quic(sk);
-    hlist_nulls_add_head_rcu(&udp_sk(sk)->udp_portaddr_node, &hslot->head);
+    hlist_add_head_rcu(&udp_sk(sk)->udp_portaddr_node, &hslot->head);
     sock_prot_inuse_add(net, sk->sk_prot, 1);
 
     spin_unlock_bh(&hslot->lock);
@@ -246,7 +242,7 @@ void quic_unhash(struct sock *sk)
         return udp_lib_unhash(sk);
     }
 
-    BUG_ON(hlist_nulls_unhashed(&udp_sk(sk)->udp_portaddr_node));
+    BUG_ON(hlist_unhashed(&udp_sk(sk)->udp_portaddr_node));
 
     slot = sk->sk_hash & quic_table.mask;
     hslot = &quic_table.hash[slot];
@@ -257,7 +253,7 @@ void quic_unhash(struct sock *sk)
 
     spin_lock_bh(&hslot->lock);
 
-    hlist_nulls_del_init_rcu(&udp_sk(sk)->udp_portaddr_node);
+    hlist_del_init_rcu(&udp_sk(sk)->udp_portaddr_node);
     unset_quic(sk);
     WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
     __sock_put(sk);
@@ -360,7 +356,7 @@ int quic_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
     inet->inet_daddr = fl4->daddr;
     inet->inet_dport = usin->sin_port;
     sk->sk_state = TCP_ESTABLISHED;
-    inet_set_txhash(sk);
+    sk_set_txhash(sk);
     inet->inet_id = jiffies;
 
     sk_dst_set(sk, &rt->dst);
@@ -518,7 +514,7 @@ int __init quic_table_init(void)
     quic_table.mask = entries - 1;
 
     for (i = 0; i <= quic_table.mask; i++) {
-        INIT_HLIST_NULLS_HEAD(&quic_table.hash[i].head, i);
+        INIT_HLIST_HEAD(&quic_table.hash[i].head);
         spin_lock_init(&quic_table.hash[i].lock);
     }
 
