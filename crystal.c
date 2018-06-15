@@ -132,6 +132,15 @@ static inline void unset_quic(struct sock *sk)
     sock_reset_flag(sk, SOCK_QUIC);
 }
 
+static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
+{
+    struct dst_entry *old;
+
+    dst_hold(dst);
+    old = xchg(&sk->sk_rx_dst, dst);
+    dst_release(old);
+}
+
 static unsigned int quic_ehashfn(struct net *net, const __be32 laddr,
                  const __u16 lport, const __be32 faddr,
                  const __be16 fport)
@@ -159,17 +168,12 @@ static inline struct sock *__quic_lib_lookup(struct net *net, __be32 saddr,
     DEBUG_QUIC("quic lookup: laddr = %x, faddr = %x, hnum = %u, fport = %u, hash = %x, slot = %u\n",
                daddr, saddr, hnum, ntohs(sport), hash, slot);
 
-    rcu_read_lock();
 begin:
     udp_portaddr_for_each_entry_rcu(sk, &hslot->head) {
         if (sk->sk_hash != hash)
             continue;
         if (likely(INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
-            if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt)))
-                goto out;
-            if (unlikely((!INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif)) ||
-                         (!is_quic(sk)))) {
-                sock_put(sk);
+            if (unlikely(!is_quic(sk))) {
                 goto begin;
             }
             DEBUG_QUIC("quic lookup success: laddr = %x, faddr = %x, hnum = %u, fport = %u, hash = %x, slot = %u\n",
@@ -177,10 +181,9 @@ begin:
             goto found;
         }
     }
-out:
+
     sk = NULL;
 found:
-    rcu_read_unlock();
     return sk;
 }
 
@@ -374,9 +377,6 @@ static inline struct sock *__udp4_lib_lookup_skb(struct sk_buff *skb,
     struct net *net;
     const struct iphdr *iph = ip_hdr(skb);
 
-    if (unlikely(sk = skb_steal_sock(skb)))
-        return sk;
-
     net = dev_net(skb_dst(skb)->dev);
 
     sk = __quic_lib_lookup(net, iph->saddr, sport, iph->daddr, dport, inet_iif(skb));
@@ -437,6 +437,24 @@ static int quic_rcv(struct sk_buff *skb)
     if (udp4_csum_init(skb, uh, proto))
         goto csum_error;
 
+    sk = skb_steal_sock(skb);
+    if (sk) {
+        struct dst_entry *dst = skb_dst(skb);
+        int ret;
+
+        if (unlikely(sk->sk_rx_dst != dst))
+            udp_sk_rx_dst_set(sk, dst);
+
+        ret = orig_queue_rcv_skb(sk, skb);
+        sock_put(sk);
+        /* a return value > 0 means to resubmit the input, but
+         * it wants the return to be -protocol, or 0
+         */
+        if (ret > 0)
+            return -ret;
+        return 0;
+    }
+
     sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
 
     if (sk != NULL) {
@@ -447,7 +465,6 @@ static int quic_rcv(struct sk_buff *skb)
                          inet_compute_pseudo);
 
         ret = orig_queue_rcv_skb(sk, skb);
-        sock_put(sk);
 
         /* a return value > 0 means to resubmit the input, but
          * it wants the return to be -protocol, or 0
