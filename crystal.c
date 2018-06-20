@@ -287,6 +287,9 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
     /* TODO: there may be performance issue, need to improve */ 
     // synchronize_rcu();
 
+    sock_prot_inuse_add(net, sk->sk_prot, 1);
+    __module_get(THIS_MODULE);
+
     spin_lock_bh(&hslot->lock);
 
     udp_portaddr_for_each_entry(sk2, &hslot->head) {
@@ -294,6 +297,8 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
             continue;
         if (likely(INET_MATCH(sk2, net, acookie, faddr, laddr, ports, sk->sk_bound_dev_if))) {
             spin_unlock_bh(&hslot->lock);
+            sock_prot_inuse_add(net, sk->sk_prot, -1);
+            module_put(THIS_MODULE);
             return -1;
         }
     }
@@ -302,7 +307,6 @@ static int quic_hash_connect(struct sock *sk, __be32 laddr,
     sock_hold(sk);
     set_quic(sk);
     hlist_add_head_rcu(&udp_sk(sk)->udp_portaddr_node, &hslot->head);
-    sock_prot_inuse_add(net, sk->sk_prot, 1);
 
     spin_unlock_bh(&hslot->lock);
 
@@ -339,9 +343,11 @@ void quic_unhash(struct sock *sk)
     unset_quic(sk);
     WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
     __sock_put(sk);
-    sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 
     spin_unlock_bh(&hslot->lock);
+
+    sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
+    module_put(THIS_MODULE);
 
     release_sock(sk);
 
